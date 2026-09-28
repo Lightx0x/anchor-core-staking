@@ -1,16 +1,15 @@
 use anchor_lang::prelude::*;
-use anchor_spl::{associated_token::AssociatedToken, token_interface::{Mint, TokenAccount, TokenInterface, mint_to_checked, MintToChecked}};
+use anchor_spl::{associated_token::AssociatedToken, token_interface::{Mint, TokenAccount, TokenInterface}};
 use mpl_core::{
     ID as MPL_CORE_ID,
     accounts::{BaseAssetV1, BaseCollectionV1},
     types::{UpdateAuthority, Attribute, Attributes, Plugin, PluginType, FreezeDelegate},
-    instructions::{UpdatePluginV1CpiBuilder},
-    fetch_plugin,
+    instructions::{UpdatePluginV1CpiBuilder, RemovePluginV1CpiBuilder},
 };
 use crate::Config;
+use crate::constants::*;
 use crate::error::ErrorCode;
-
-const SECONDS_PER_DAY: i64 = 86400;
+use crate::utils::{read_stake_info, days_between, calculate_rewards, mint_rewards, update_total_staked};
 
 #[derive(Accounts)]
 pub struct Unstake<'info> {
@@ -60,43 +59,16 @@ pub struct Unstake<'info> {
 }
 pub fn handler(ctx: Context<Unstake>) -> Result<()> {
 
-    // We start by fetching the existing attributes
-    let attributes_fetched: Option<Attributes> = fetch_plugin::<BaseAssetV1, Attributes>(
-        &ctx.accounts.asset.to_account_info(),
-        PluginType::Attributes,
-    )
-    .ok()
-    .map(|(_, attrs, _)| attrs);
-
-    // If the attributes don't exist, we return an error
-    require!(attributes_fetched.is_some(), ErrorCode::AssetNotStaked);
-
-    let attributes = attributes_fetched.unwrap();
-
-    // Prepare the Attributes list to update based on the existing attributes
-    let mut attributes_list: Vec<Attribute> = Vec::with_capacity(attributes.attribute_list.len());
-
-    // Additional auxiliary variables
+    // Read the Staking attributes (fails if the asset is not staked)
+    let stake_info = read_stake_info(&ctx.accounts.asset.to_account_info())?;
     let current_timestamp = Clock::get()?.unix_timestamp;
-    let mut staked_timestamp: i64 = 0;
-    let mut staked_time: i64 = 0;
 
-    for attribute in &attributes.attribute_list {
-        if attribute.key == "staked" {
-            require!(attribute.value == "true", ErrorCode::AssetNotStaked);
-        }
-        else if attribute.key == "staked_at" {
-            staked_timestamp = staked_timestamp.checked_add(attribute.value.parse::<i64>().map_err(|_| ErrorCode::InvalidTimestamp)?).ok_or(ErrorCode::InvalidTimestamp)?;
-            // Calculate the time (in seconds) since the asset was staked
-            staked_time = current_timestamp.checked_sub(staked_timestamp).ok_or(ErrorCode::InvalidTimestamp)?;
-            // Staked time in days
-            staked_time = staked_time.checked_div(SECONDS_PER_DAY).ok_or(ErrorCode::InvalidTimestamp)?;
-            require!(staked_time >= ctx.accounts.config.freeze_period as i64, ErrorCode::FreezePeriodNotElapsed);
-        }
-        else {
-            attributes_list.push(attribute.clone());
-        }
-    }
+    // The freeze period is counted from the moment the asset was staked
+    let staked_days = days_between(stake_info.staked_at, current_timestamp)?;
+    require!(staked_days >= ctx.accounts.config.freeze_period as i64, ErrorCode::FreezePeriodNotElapsed);
+
+    // Rewards are counted from the last claim (or the stake, if never claimed)
+    let unclaimed_days = days_between(stake_info.last_claimed_at, current_timestamp)?;
 
     // Prepare signing seeds for the update authority
     let collection_key = ctx.accounts.collection.key();
@@ -107,14 +79,17 @@ pub fn handler(ctx: Context<Unstake>) -> Result<()> {
     ];
 
     // Now we update the asset Atributes Plugin (with the existing attributes, including the Staking attributes with reset values)
-
-    // Add the Staking attributes first (reset values)
+    let mut attributes_list: Vec<Attribute> = stake_info.other_attributes;
     attributes_list.push(Attribute {
-        key: "staked".to_string(),
+        key: STAKED_KEY.to_string(),
         value: "false".to_string(),
     });
     attributes_list.push(Attribute {
-        key: "staked_at".to_string(),
+        key: STAKED_AT_KEY.to_string(),
+        value: "0".to_string(),
+    });
+    attributes_list.push(Attribute {
+        key: LAST_CLAIMED_AT_KEY.to_string(),
         value: "0".to_string(),
     });
 
@@ -137,35 +112,40 @@ pub fn handler(ctx: Context<Unstake>) -> Result<()> {
     .plugin(Plugin::FreezeDelegate(FreezeDelegate { frozen: false }))
     .invoke_signed(&[signer_seeds])?;
 
-    // Finally, we want to mint rewards to the user
+    // Remove the FreezeDelegate and BurnDelegate Plugins so the owner gets full control back
+    // (and the asset can be staked again, which adds them anew)
+    // Both are Owner-Managed Plugins, so they are removed by the owner
+    for plugin_type in [PluginType::FreezeDelegate, PluginType::BurnDelegate] {
+        RemovePluginV1CpiBuilder::new(&ctx.accounts.mpl_core_program.to_account_info())
+        .asset(&ctx.accounts.asset.to_account_info())
+        .collection(Some(&ctx.accounts.collection.to_account_info()))
+        .payer(&ctx.accounts.owner.to_account_info())
+        .authority(Some(&ctx.accounts.owner.to_account_info()))
+        .system_program(&ctx.accounts.system_program.to_account_info())
+        .plugin_type(plugin_type)
+        .invoke()?;
+    }
 
-    // Calculate the amount
-    let amount =(staked_time as u64)
-        .checked_mul(ctx.accounts.config.rewards_bps as u64)
-        .ok_or(ErrorCode::InvalidRewardsBps)?
-        .checked_mul(10u64.pow(ctx.accounts.rewards_mint.decimals as u32))
-        .ok_or(ErrorCode::InvalidRewardsBps)?
-        .checked_div(10000u64)
-        .ok_or(ErrorCode::InvalidRewardsBps)?;
+    // Decrement the "total_staked" counter on the Collection
+    update_total_staked(
+        &ctx.accounts.mpl_core_program.to_account_info(),
+        &ctx.accounts.collection.to_account_info(),
+        &ctx.accounts.owner.to_account_info(),
+        &ctx.accounts.update_authority.to_account_info(),
+        &ctx.accounts.system_program.to_account_info(),
+        ctx.bumps.update_authority,
+        false,
+    )?;
 
-    // Prepare signer seeds for config PDA
-    let config_seeds = &[
-        b"config",
-        collection_key.as_ref(),
-        &[ctx.accounts.config.bump],
-    ];
-    let config_signer_seeds = &[&config_seeds[..]];
-
-    mint_to_checked(
-        CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            MintToChecked {
-                mint: ctx.accounts.rewards_mint.to_account_info(),
-                to: ctx.accounts.user_rewards_ata.to_account_info(),
-                authority: ctx.accounts.config.to_account_info(),
-            },
-            config_signer_seeds,
-        ),
+    // Finally, we mint the unclaimed rewards to the user
+    let amount = calculate_rewards(unclaimed_days, ctx.accounts.config.rewards_bps, ctx.accounts.rewards_mint.decimals)?;
+    mint_rewards(
+        ctx.accounts.token_program.to_account_info(),
+        ctx.accounts.rewards_mint.to_account_info(),
+        ctx.accounts.user_rewards_ata.to_account_info(),
+        ctx.accounts.config.to_account_info(),
+        &collection_key,
+        ctx.accounts.config.bump,
         amount,
         ctx.accounts.rewards_mint.decimals,
     )?;

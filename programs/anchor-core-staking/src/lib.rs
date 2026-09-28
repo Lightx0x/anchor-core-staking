@@ -4,6 +4,7 @@ pub mod constants;
 pub mod error;
 pub mod instructions;
 pub mod state;
+pub mod utils;
 
 use anchor_lang::prelude::*;
 
@@ -11,7 +12,7 @@ pub use constants::*;
 pub use instructions::*;
 pub use state::*;
 
-declare_id!("FkP21JjeMc9gcq9iBQBHfLocaLsxCYGLg4jgwin6pBwG");
+declare_id!("HX3oFidWLR8FLHyRCU5F6H2ghHMDDeAUhnAf7HKTuvgR");
 
 #[program]
 pub mod anchor_core_staking {
@@ -35,6 +36,14 @@ pub mod anchor_core_staking {
 
     pub fn unstake(ctx: Context<Unstake>) -> Result<()> {
         unstake::handler(ctx)
+    }
+
+    pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
+        claim_rewards::handler(ctx)
+    }
+
+    pub fn burn_staked_nft(ctx: Context<BurnStakedNft>) -> Result<()> {
+        burn_staked_nft::handler(ctx)
     }
 
 }
