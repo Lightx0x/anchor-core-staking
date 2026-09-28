@@ -16,4 +16,6 @@ pub enum ErrorCode {
     FreezePeriodNotElapsed,
     #[msg("Invalid rewards bps")]
     InvalidRewardsBps,
+    #[msg("Invalid total staked counter")]
+    InvalidTotalStaked,
 }
